@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
@@ -20,6 +21,12 @@ from usage import format_reset_local, left_color
 # 行内操作区固定宽度（切换+复制+限额+用量 + 间距）
 # 56+4+48+4+48+4+48 ≈ 212
 ROW_ACTIONS_W = 220
+
+# 仅轮询操作系统的前台进程，不监听 Tk 子控件焦点。这样点击账户、按钮或
+# 关闭本程序自己的弹窗都不会被误判成“重新回到前台”。
+FOREGROUND_POLL_MS = 500
+# 自动刷新采用短期缓存；顶部“刷限额”按钮始终绕过该缓存。
+AUTO_QUOTA_REFRESH_TTL_SECONDS = 5 * 60
 
 
 # ---- 白色主题 ----
@@ -75,23 +82,23 @@ class CodexAccountApp(ctk.CTk):
         self._switch_verify_generation = 0
         self._activation_path: Path | None = None
         self._activation_token = ""
-        self._focus_probe_after_id: str | None = None
+        self._foreground_poll_after_id: str | None = None
         self._window_was_foreground = False
         self._focus_refresh_pending = False
         self._focus_quota_refresh_running = False
+        self._last_auto_quota_attempt_monotonic = 0.0
 
         self._build_ui()
-        # 子控件焦点事件会经过顶层 bindtag；延迟检查真正的前台进程，
-        # 只有从其他应用重新聚焦本程序时才刷新，不会因点内部按钮反复请求。
-        self.bind("<FocusIn>", self._on_window_focus_event, add="+")
-        self.bind("<FocusOut>", self._on_window_focus_event, add="+")
-        self.bind("<Map>", self._on_window_focus_event, add="+")
-        self.bind("<Unmap>", self._on_window_focus_event, add="+")
         # 首屏只读 auth/config 并立即绘制；SQLite 汇总和 tasklist 都放到后台。
         self.refresh_ui_light(keep_selection=False, load_usage=False)
         self.set_status("正在后台同步…")
         # 后台：同步当前账户 + 仅查当前限额（不全量扫）
         self.after(100, self.startup_auth_check)
+        # 独立轮询整个进程的前台状态，避免 Tk 控件焦点事件造成重复请求。
+        self._foreground_poll_after_id = self.after(
+            250,
+            self._poll_foreground_state,
+        )
 
     def _set_window_icon(self) -> None:
         """设置标题栏和任务栏图标；保留 PhotoImage 引用避免被 Tk 回收。"""
@@ -154,46 +161,84 @@ class CodexAccountApp(ctk.CTk):
         except (AttributeError, tk.TclError):
             pass
 
-    def _on_window_focus_event(self, _event: Any = None) -> None:
-        """合并焦点/显示事件，稍后判断本程序是否真正成为前台。"""
-        if self._focus_probe_after_id is not None:
-            try:
-                self.after_cancel(self._focus_probe_after_id)
-            except tk.TclError:
-                pass
-        try:
-            self._focus_probe_after_id = self.after(
-                120,
-                self._probe_window_foreground,
-            )
-        except tk.TclError:
-            self._focus_probe_after_id = None
-
-    def _probe_window_foreground(self) -> None:
-        self._focus_probe_after_id = None
+    def _poll_foreground_state(self) -> None:
+        """检测整个程序是否从后台回到前台，并持续安排下一次轻量检测。"""
+        self._foreground_poll_after_id = None
         try:
             visible = self.state() not in ("iconic", "withdrawn")
         except tk.TclError:
             return
-        if not visible:
-            self._window_was_foreground = False
-            return
-        try:
-            from windows_app import is_current_process_foreground
+        foreground = False
+        if visible:
+            try:
+                from windows_app import is_current_process_foreground
 
-            foreground = is_current_process_foreground()
-        except Exception:
-            foreground = bool(self.focus_displayof())
-        if not foreground:
+                foreground = is_current_process_foreground()
+            except Exception:
+                foreground = bool(self.focus_displayof())
+        if foreground:
+            became_foreground = not self._window_was_foreground
+            self._window_was_foreground = True
+            if became_foreground and self._startup_checked:
+                self._request_focus_quota_refresh()
+        else:
             self._window_was_foreground = False
-            return
-        became_foreground = not self._window_was_foreground
-        self._window_was_foreground = True
-        if became_foreground and self._startup_checked:
-            self._request_focus_quota_refresh()
+
+        try:
+            self._foreground_poll_after_id = self.after(
+                FOREGROUND_POLL_MS,
+                self._poll_foreground_state,
+            )
+        except tk.TclError:
+            self._foreground_poll_after_id = None
+
+    @staticmethod
+    def _usage_fetched_epoch(value: str) -> float | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    def _auto_quota_refresh_due(
+        self,
+        *,
+        now_epoch: float | None = None,
+        now_monotonic: float | None = None,
+    ) -> bool:
+        """缓存过期才自动刷新；失败的整批请求也至少冷却五分钟。"""
+        monotonic_now = time.monotonic() if now_monotonic is None else now_monotonic
+        last_attempt = self._last_auto_quota_attempt_monotonic
+        if (
+            last_attempt > 0
+            and monotonic_now - last_attempt < AUTO_QUOTA_REFRESH_TTL_SECONDS
+        ):
+            return False
+
+        profiles = [
+            profile
+            for profile in self.mgr.list_profiles()
+            if not profile_uses_api_key(profile)
+        ]
+        if not profiles:
+            return False
+
+        wall_now = time.time() if now_epoch is None else now_epoch
+        for profile in profiles:
+            fetched_epoch = self._usage_fetched_epoch(profile.usage_fetched_at)
+            if fetched_epoch is None:
+                return True
+            if wall_now - fetched_epoch >= AUTO_QUOTA_REFRESH_TTL_SECONDS:
+                return True
+        return False
 
     def _request_focus_quota_refresh(self) -> None:
-        """前台且非最小化时静默刷新全部限额；忙碌时合并为一次待刷新。"""
+        """回到前台且缓存过期时静默刷新；忙碌时合并为一次待刷新。"""
         try:
             if self.state() in ("iconic", "withdrawn"):
                 return
@@ -204,6 +249,9 @@ class CodexAccountApp(ctk.CTk):
         except (tk.TclError, OSError):
             return
         self._window_was_foreground = True
+        if not self._auto_quota_refresh_due():
+            self._focus_refresh_pending = False
+            return
         if self._busy or self._focus_quota_refresh_running:
             self._focus_refresh_pending = True
             return
@@ -1394,10 +1442,8 @@ class CodexAccountApp(ctk.CTk):
                 self.refresh_ui_light(keep_selection=True, load_usage=False)
                 self.set_status(status_msg or "就绪", ok=("失败" not in (status_msg or "")))
                 self._refresh_usage_cache_async()
-                # 启动也算一次聚焦。复用前台状态探测，避免 Map 事件与
-                # 启动回调各触发一轮相同的限额请求。
-                if not self._window_was_foreground:
-                    self._on_window_focus_event()
+                # 启动也检查一次。前台轮询与五分钟缓存会自动合并重复触发。
+                self.after(120, self._request_focus_quota_refresh)
                 # 限额刷新期间先等待，避免启动用量同步被 _busy 直接丢弃。
                 self.after(1200, self._sync_startup_usage_when_idle)
 
@@ -1686,9 +1732,10 @@ class CodexAccountApp(ctk.CTk):
             return
         if quiet:
             self._focus_quota_refresh_running = True
+            self._last_auto_quota_attempt_monotonic = time.monotonic()
         self.set_busy(
             True,
-            "窗口已聚焦，正在刷新限额…" if quiet else "正在刷新全部限额…",
+            "窗口回到前台，正在刷新限额…" if quiet else "正在刷新全部限额…",
         )
 
         def work() -> None:

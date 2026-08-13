@@ -596,40 +596,109 @@ class TestQuotaPeriodUsage(unittest.TestCase):
 
 
 class TestFocusQuotaRefresh(unittest.TestCase):
-    def test_minimized_window_does_not_refresh(self):
+    def test_minimized_poll_does_not_refresh_and_keeps_polling(self):
         requested: list[bool] = []
+        scheduled: list[tuple[int, object]] = []
         app = SimpleNamespace(
-            _focus_probe_after_id="pending",
+            _foreground_poll_after_id="pending",
             _window_was_foreground=True,
             _startup_checked=True,
             state=lambda: "iconic",
+            after=lambda delay, callback: scheduled.append((delay, callback)) or "next",
+            _poll_foreground_state=lambda: None,
             _request_focus_quota_refresh=lambda: requested.append(True),
         )
 
-        CodexAccountApp._probe_window_foreground(app)
+        CodexAccountApp._poll_foreground_state(app)
 
         self.assertFalse(app._window_was_foreground)
         self.assertEqual(requested, [])
+        self.assertEqual(scheduled[0][0], 500)
+        self.assertEqual(app._foreground_poll_after_id, "next")
 
     def test_real_foreground_transition_requests_one_refresh(self):
         requested: list[bool] = []
         app = SimpleNamespace(
-            _focus_probe_after_id="pending",
+            _foreground_poll_after_id="pending",
             _window_was_foreground=False,
             _startup_checked=True,
             state=lambda: "normal",
             focus_displayof=lambda: True,
+            after=lambda _delay, _callback: "next",
+            _poll_foreground_state=lambda: None,
             _request_focus_quota_refresh=lambda: requested.append(True),
         )
         with mock.patch(
             "windows_app.is_current_process_foreground",
             return_value=True,
         ):
-            CodexAccountApp._probe_window_foreground(app)
-            CodexAccountApp._probe_window_foreground(app)
+            CodexAccountApp._poll_foreground_state(app)
+            CodexAccountApp._poll_foreground_state(app)
 
         self.assertTrue(app._window_was_foreground)
         self.assertEqual(requested, [True])
+
+    def test_recent_quota_cache_skips_auto_refresh(self):
+        profile = AccountProfile(
+            id="p1",
+            name="p1",
+            usage_fetched_at=datetime.fromtimestamp(
+                1_000_000 - 60,
+                timezone.utc,
+            ).isoformat(),
+        )
+        app = SimpleNamespace(
+            mgr=SimpleNamespace(list_profiles=lambda: [profile]),
+            _last_auto_quota_attempt_monotonic=0.0,
+            _usage_fetched_epoch=CodexAccountApp._usage_fetched_epoch,
+        )
+
+        self.assertFalse(
+            CodexAccountApp._auto_quota_refresh_due(
+                app,
+                now_epoch=1_000_000,
+                now_monotonic=500,
+            )
+        )
+
+    def test_stale_quota_cache_allows_auto_refresh(self):
+        profile = AccountProfile(
+            id="p1",
+            name="p1",
+            usage_fetched_at=datetime.fromtimestamp(
+                1_000_000 - 300,
+                timezone.utc,
+            ).isoformat(),
+        )
+        app = SimpleNamespace(
+            mgr=SimpleNamespace(list_profiles=lambda: [profile]),
+            _last_auto_quota_attempt_monotonic=0.0,
+            _usage_fetched_epoch=CodexAccountApp._usage_fetched_epoch,
+        )
+
+        self.assertTrue(
+            CodexAccountApp._auto_quota_refresh_due(
+                app,
+                now_epoch=1_000_000,
+                now_monotonic=500,
+            )
+        )
+
+    def test_recent_failed_attempt_blocks_an_immediate_retry(self):
+        profile = AccountProfile(id="p1", name="p1")
+        app = SimpleNamespace(
+            mgr=SimpleNamespace(list_profiles=lambda: [profile]),
+            _last_auto_quota_attempt_monotonic=450.0,
+            _usage_fetched_epoch=CodexAccountApp._usage_fetched_epoch,
+        )
+
+        self.assertFalse(
+            CodexAccountApp._auto_quota_refresh_due(
+                app,
+                now_epoch=1_000_000,
+                now_monotonic=500,
+            )
+        )
 
     def test_foreground_refresh_is_silent_and_busy_refresh_is_coalesced(self):
         calls: list[bool] = []
@@ -639,6 +708,7 @@ class TestFocusQuotaRefresh(unittest.TestCase):
             _focus_refresh_pending=False,
             _window_was_foreground=False,
             state=lambda: "normal",
+            _auto_quota_refresh_due=lambda: True,
             refresh_all_quotas=lambda quiet=False: calls.append(quiet),
         )
         with mock.patch(
