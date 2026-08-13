@@ -1394,8 +1394,10 @@ class CodexAccountApp(ctk.CTk):
                 self.refresh_ui_light(keep_selection=True, load_usage=False)
                 self.set_status(status_msg or "就绪", ok=("失败" not in (status_msg or "")))
                 self._refresh_usage_cache_async()
-                # 启动也算一次聚焦：仅当前台可见时刷新，最小化/后台不联网。
-                self.after(120, self._request_focus_quota_refresh)
+                # 启动也算一次聚焦。复用前台状态探测，避免 Map 事件与
+                # 启动回调各触发一轮相同的限额请求。
+                if not self._window_was_foreground:
+                    self._on_window_focus_event()
                 # 限额刷新期间先等待，避免启动用量同步被 _busy 直接丢弃。
                 self.after(1200, self._sync_startup_usage_when_idle)
 
