@@ -1,0 +1,49 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Build output — release binaries are uploaded as GitHub Release assets, never committed
+build/
+dist/
+release/
+*.exe
+*.msi
+*.spec
+*.zip
+
+# Local credentials and account data
+auth.json
+auth*.json
+credentials*.json
+token*.json
+config.json
+profiles/
+backups/
+sessions/
+.codex/
+.codex-account-manager/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.key
+*.log
+
+# Editor / OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store
