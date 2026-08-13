@@ -373,6 +373,7 @@ class CodexAccountManager:
         elif not self.config.codex_home:
             self.config.codex_home = str(default_codex_home())
         self._token_store = None
+        self._usage_attribution_checked = False
 
     # ---------- paths ----------
     @property
@@ -487,7 +488,7 @@ class CodexAccountManager:
             and (last["profile_id"] or "") == profile_id
             and (last["email"] or "") == email
         )
-        if same and source in ("startup", "active", "baseline"):
+        if same:
             return
         store.log_switch(
             profile_id=profile_id,
@@ -526,11 +527,18 @@ class CodexAccountManager:
             recent_days=None if full else recent_days,
             max_files=None if full else 40,
         )
-        if reattribute:
+        # 升级后的第一次同步做一次全量校正；之后仅在确有新事件时校正，
+        # 避免每次切回窗口都重复遍历整个历史库。
+        should_reattribute = reattribute and (
+            not self._usage_attribution_checked
+            or int(result.get("inserted_events") or 0) > 0
+        )
+        if should_reattribute:
             # 严格按切换时间线重算归属，避免「单账户吞掉全部历史」
             attr = store.reattribute_all(self.profile_fallback_list())
             result["reattributed"] = attr.get("updated", 0)
             result["cleared_to_unknown"] = attr.get("cleared_to_unknown", 0)
+            self._usage_attribution_checked = True
         result["attribution"] = store.count_stats()
         return result
 
@@ -1321,6 +1329,8 @@ class CodexAccountManager:
 
         auth = self._read_profile_auth(profile_id)
         do_restart = self.config.auto_restart if restart is None else restart
+        previous_live_auth = self.read_live_auth()
+        previous_active_id = self.config.active_id
 
         # 切换前尽量同步当前登录态，避免 token 丢失
         try:
@@ -1355,6 +1365,7 @@ class CodexAccountManager:
             written_key = account_identity_key(written)
             if expected_key and written_key != expected_key:
                 raise RuntimeError("目标凭据写入后校验失败，未启动 Codex")
+            switch_epoch = time.time()
 
             now = _utc_now_iso()
             profile.last_used_at = now
@@ -1368,18 +1379,28 @@ class CodexAccountManager:
             self.config.active_id = profile.id
             self.save_config()
 
-            # 记录切换时间线，后续 session token 可归属到该账户
-            try:
-                self.token_store().log_switch(
-                    profile_id=profile.id,
-                    account_id=profile.account_id or info.get("account_id") or "",
-                    email=profile.email or info.get("email") or "",
-                    source="switch",
-                )
-            except Exception:
-                pass
+            # 在新 Codex 启动前持久化切换边界。该写入与会话扫描串行，
+            # 不能静默忽略，否则新账户的事件可能继续归入旧账户。
+            self.token_store().log_switch(
+                profile_id=profile.id,
+                account_id=profile.account_id or info.get("account_id") or "",
+                email=profile.email or info.get("email") or "",
+                source="switch",
+                ts=switch_epoch,
+            )
         except Exception:
-            # 已结束 Codex 后即使切换失败，也尽量恢复应用窗口供用户处理。
+            # 时间线未能可靠写入时回滚凭据，避免界面显示已切换但用量串账。
+            if previous_live_auth:
+                try:
+                    self.write_live_auth(previous_live_auth)
+                except Exception:
+                    log.exception("切换失败后恢复原 live auth 失败")
+            self.config.active_id = previous_active_id
+            try:
+                self.save_config()
+            except Exception:
+                log.exception("切换失败后恢复 active_id 失败")
+            # 已结束 Codex 后尽量恢复原账户并重新打开应用。
             if stopped_for_switch:
                 self.launch_codex()
             raise

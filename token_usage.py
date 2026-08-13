@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -78,6 +79,9 @@ class TokenUsageStore:
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.store_dir / "token_usage.sqlite"
         self.sessions_dir = Path(sessions_dir) if sessions_dir else (Path.home() / ".codex" / "sessions")
+        # 会话扫描会先读取整份切换时间线。扫描与账户切换必须串行，
+        # 否则扫描可能拿着旧时间线，把切换后的新事件仍写到旧账户。
+        self._write_lock = threading.RLock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -169,14 +173,51 @@ class TokenUsageStore:
     ) -> None:
         epoch = ts if ts is not None else time.time()
         ts_iso = datetime.fromtimestamp(epoch, tz=timezone.utc).replace(microsecond=0).isoformat()
-        with self._connection() as con:
-            con.execute(
-                """
-                INSERT INTO account_switches(ts, ts_iso, profile_id, account_id, email, source)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (epoch, ts_iso, profile_id or "", account_id or "", email or "", source),
-            )
+        with self._write_lock:
+            with self._connection() as con:
+                con.execute(
+                    """
+                    INSERT INTO account_switches(ts, ts_iso, profile_id, account_id, email, source)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (epoch, ts_iso, profile_id or "", account_id or "", email or "", source),
+                )
+                # 若切换记录晚于会话扫描写入（例如外部换号后才重新打开本工具），
+                # 立即修正该时间段内已经入库的事件，不必等用户手动全量同步。
+                next_row = con.execute(
+                    "SELECT MIN(ts) AS ts FROM account_switches WHERE ts > ?",
+                    (epoch,),
+                ).fetchone()
+                next_epoch = next_row["ts"] if next_row else None
+                if next_epoch is None:
+                    con.execute(
+                        """
+                        UPDATE usage_events
+                        SET profile_id=?, account_id=?, email=?
+                        WHERE event_epoch >= ?
+                        """,
+                        (
+                            profile_id or "",
+                            account_id or "",
+                            email or "",
+                            epoch,
+                        ),
+                    )
+                else:
+                    con.execute(
+                        """
+                        UPDATE usage_events
+                        SET profile_id=?, account_id=?, email=?
+                        WHERE event_epoch >= ? AND event_epoch < ?
+                        """,
+                        (
+                            profile_id or "",
+                            account_id or "",
+                            email or "",
+                            epoch,
+                            next_epoch,
+                        ),
+                    )
 
     def ensure_baseline_switch(
         self,
@@ -189,26 +230,27 @@ class TokenUsageStore:
         若还没有任何切换记录，写入当前账户作为「从此刻起」的基线。
         注意：基线时间戳 = 现在，更早的 session 不会被归到该账户。
         """
-        with self._connection() as con:
-            n = con.execute("SELECT COUNT(*) AS c FROM account_switches").fetchone()["c"]
-            if n == 0 and (account_id or profile_id or email):
-                epoch = time.time()
-                con.execute(
-                    """
-                    INSERT INTO account_switches(ts, ts_iso, profile_id, account_id, email, source)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        epoch,
-                        datetime.fromtimestamp(epoch, tz=timezone.utc)
-                        .replace(microsecond=0)
-                        .isoformat(),
-                        profile_id or "",
-                        account_id or "",
-                        email or "",
-                        "baseline",
-                    ),
-                )
+        with self._write_lock:
+            with self._connection() as con:
+                n = con.execute("SELECT COUNT(*) AS c FROM account_switches").fetchone()["c"]
+                if n == 0 and (account_id or profile_id or email):
+                    epoch = time.time()
+                    con.execute(
+                        """
+                        INSERT INTO account_switches(ts, ts_iso, profile_id, account_id, email, source)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            epoch,
+                            datetime.fromtimestamp(epoch, tz=timezone.utc)
+                            .replace(microsecond=0)
+                            .isoformat(),
+                            profile_id or "",
+                            account_id or "",
+                            email or "",
+                            "baseline",
+                        ),
+                    )
 
     def _load_switches(self, con: sqlite3.Connection | None = None) -> list[sqlite3.Row]:
         if con is not None:
@@ -278,6 +320,22 @@ class TokenUsageStore:
         return sorted(self.sessions_dir.rglob("rollout-*.jsonl"))
 
     def sync_sessions(
+        self,
+        *,
+        fallback_profiles: list[dict[str, str]] | None = None,
+        max_files: int | None = None,
+        recent_days: int | None = 45,
+        full: bool = False,
+    ) -> dict[str, Any]:
+        with self._write_lock:
+            return self._sync_sessions_locked(
+                fallback_profiles=fallback_profiles,
+                max_files=max_files,
+                recent_days=recent_days,
+                full=full,
+            )
+
+    def _sync_sessions_locked(
         self,
         *,
         fallback_profiles: list[dict[str, str]] | None = None,
@@ -677,6 +735,13 @@ class TokenUsageStore:
 
     def reattribute_all(self, fallback_profiles: list[dict[str, str]] | None = None) -> dict[str, int]:
         """按当前严格时间线重算全部事件归属（修正历史误归属）。"""
+        with self._write_lock:
+            return self._reattribute_all_locked(fallback_profiles)
+
+    def _reattribute_all_locked(
+        self,
+        fallback_profiles: list[dict[str, str]] | None = None,
+    ) -> dict[str, int]:
         updated = 0
         cleared = 0
         with self._connection() as con:

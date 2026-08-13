@@ -27,6 +27,8 @@ ROW_ACTIONS_W = 220
 FOREGROUND_POLL_MS = 500
 # 自动刷新采用短期缓存；顶部“刷限额”按钮始终绕过该缓存。
 AUTO_QUOTA_REFRESH_TTL_SECONDS = 5 * 60
+# 回到前台时增量读取本地会话文件，不联网；短时间反复切换窗口只扫一次。
+AUTO_USAGE_SYNC_TTL_SECONDS = 30
 
 
 # ---- 白色主题 ----
@@ -77,6 +79,9 @@ class CodexAccountApp(ctk.CTk):
         self._startup_checked = False
         self._usage_cache: dict[str, dict] = {}
         self._usage_cache_loading = False
+        self._usage_cache_refresh_pending = False
+        self._usage_sync_running = False
+        self._last_auto_usage_sync_monotonic = 0.0
         self._codex_running_cache: tuple[float, bool] | None = None
         self._codex_check_generation = 0
         self._switch_verify_generation = 0
@@ -86,7 +91,7 @@ class CodexAccountApp(ctk.CTk):
         self._window_was_foreground = False
         self._focus_refresh_pending = False
         self._focus_quota_refresh_running = False
-        self._last_auto_quota_attempt_monotonic = 0.0
+        self._auto_quota_attempts: dict[str, float] = {}
 
         self._build_ui()
         # 首屏只读 auth/config 并立即绘制；SQLite 汇总和 tasklist 都放到后台。
@@ -180,6 +185,8 @@ class CodexAccountApp(ctk.CTk):
             became_foreground = not self._window_was_foreground
             self._window_was_foreground = True
             if became_foreground and self._startup_checked:
+                # 本地用量增量同步不联网，先启动它以便界面及时显示切换后的用量。
+                self._request_focus_usage_sync()
                 self._request_focus_quota_refresh()
         else:
             self._window_was_foreground = False
@@ -207,35 +214,50 @@ class CodexAccountApp(ctk.CTk):
 
     def _auto_quota_refresh_due(
         self,
+        profile: AccountProfile,
         *,
         now_epoch: float | None = None,
         now_monotonic: float | None = None,
     ) -> bool:
-        """缓存过期才自动刷新；失败的整批请求也至少冷却五分钟。"""
+        """当前账户缓存过期才自动刷新；失败请求也至少冷却五分钟。"""
+        if profile_uses_api_key(profile):
+            return False
         monotonic_now = time.monotonic() if now_monotonic is None else now_monotonic
-        last_attempt = self._last_auto_quota_attempt_monotonic
+        last_attempt = self._auto_quota_attempts.get(profile.id, 0.0)
         if (
             last_attempt > 0
             and monotonic_now - last_attempt < AUTO_QUOTA_REFRESH_TTL_SECONDS
         ):
             return False
 
-        profiles = [
-            profile
-            for profile in self.mgr.list_profiles()
-            if not profile_uses_api_key(profile)
-        ]
-        if not profiles:
-            return False
-
         wall_now = time.time() if now_epoch is None else now_epoch
-        for profile in profiles:
-            fetched_epoch = self._usage_fetched_epoch(profile.usage_fetched_at)
-            if fetched_epoch is None:
-                return True
-            if wall_now - fetched_epoch >= AUTO_QUOTA_REFRESH_TTL_SECONDS:
-                return True
-        return False
+        fetched_epoch = self._usage_fetched_epoch(profile.usage_fetched_at)
+        if fetched_epoch is None:
+            return True
+        return wall_now - fetched_epoch >= AUTO_QUOTA_REFRESH_TTL_SECONDS
+
+    def _current_quota_profile(self) -> AccountProfile | None:
+        """以 live auth 为准获取当前账户，不使用界面选中行。"""
+        try:
+            profile = self.mgr.detect_active_match() or self.mgr.get_active_profile()
+        except Exception:
+            return None
+        if profile is None or profile_uses_api_key(profile):
+            return None
+        return profile
+
+    def _request_focus_usage_sync(self) -> None:
+        """回到前台时增量同步本地会话；不发网络请求、不打扰状态栏。"""
+        if self._busy or self._usage_sync_running:
+            return
+        now = time.monotonic()
+        if (
+            self._last_auto_usage_sync_monotonic > 0
+            and now - self._last_auto_usage_sync_monotonic
+            < AUTO_USAGE_SYNC_TTL_SECONDS
+        ):
+            return
+        self.sync_token_usage(quiet=True, announce=False)
 
     def _request_focus_quota_refresh(self) -> None:
         """回到前台且缓存过期时静默刷新；忙碌时合并为一次待刷新。"""
@@ -249,14 +271,15 @@ class CodexAccountApp(ctk.CTk):
         except (tk.TclError, OSError):
             return
         self._window_was_foreground = True
-        if not self._auto_quota_refresh_due():
+        profile = self._current_quota_profile()
+        if profile is None or not self._auto_quota_refresh_due(profile):
             self._focus_refresh_pending = False
             return
         if self._busy or self._focus_quota_refresh_running:
             self._focus_refresh_pending = True
             return
         self._focus_refresh_pending = False
-        self.refresh_all_quotas(quiet=True)
+        self.refresh_one_quota(profile.id, quiet=True)
 
     def _sync_startup_usage_when_idle(self, attempt: int = 0) -> None:
         """首次限额刷新期间不丢掉启动用量同步，空闲后再执行。"""
@@ -266,7 +289,7 @@ class CodexAccountApp(ctk.CTk):
                 lambda n=attempt + 1: self._sync_startup_usage_when_idle(n),
             )
             return
-        self.sync_token_usage(quiet=True)
+        self._request_focus_usage_sync()
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -675,8 +698,10 @@ class CodexAccountApp(ctk.CTk):
     def _refresh_usage_cache_async(self) -> None:
         """后台读取 SQLite 汇总；首屏和后台同步完成时都不阻塞 Tk 主线程。"""
         if self._usage_cache_loading:
+            self._usage_cache_refresh_pending = True
             return
         self._usage_cache_loading = True
+        self._usage_cache_refresh_pending = False
 
         def work() -> None:
             cache = self._build_usage_cache()
@@ -685,6 +710,9 @@ class CodexAccountApp(ctk.CTk):
                 self._usage_cache_loading = False
                 self._usage_cache = cache
                 self._update_usage_views()
+                if self._usage_cache_refresh_pending:
+                    self._usage_cache_refresh_pending = False
+                    self._refresh_usage_cache_async()
 
             try:
                 self.after(0, apply)
@@ -1451,23 +1479,46 @@ class CodexAccountApp(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def sync_token_usage(self, quiet: bool = False) -> None:
+    def sync_token_usage(self, quiet: bool = False, announce: bool = True) -> None:
         # 用户已开始 OAuth/切换/刷新时，放弃这次启动期静默同步，避免抢状态栏和磁盘。
         if self._busy:
             return
+        if self._usage_sync_running:
+            if not quiet:
+                self.set_status("本地用量正在同步…")
+            return
+        self._usage_sync_running = True
+        if quiet:
+            self._last_auto_usage_sync_monotonic = time.monotonic()
         if not quiet:
             self.set_busy(True, "同步会话用量…")
-        else:
+        elif announce:
             self.set_status("后台同步会话用量…")
 
         def work() -> None:
             try:
-                # 启动后台同步只处理新增事件；手动点击时才执行一次全量修复归属。
-                result = self.mgr.sync_token_usage(reattribute=not quiet)
-                self.after(0, lambda: self._on_usage_sync_done(result, None, quiet))
+                # 每次同步都按最新切换时间线校正归属，修复并发扫描留下的旧归属。
+                result = self.mgr.sync_token_usage(reattribute=True)
+                self.after(
+                    0,
+                    lambda: self._on_usage_sync_done(
+                        result,
+                        None,
+                        quiet,
+                        announce,
+                    ),
+                )
             except Exception as e:
                 err = str(e)
-                self.after(0, lambda err=err: self._on_usage_sync_done(None, err, quiet))
+                self.after(
+                    0,
+                    lambda err=err: self._on_usage_sync_done(
+                        None,
+                        err,
+                        quiet,
+                        announce,
+                    ),
+                )
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1476,12 +1527,15 @@ class CodexAccountApp(ctk.CTk):
         result: dict[str, Any] | None,
         err: str | None,
         quiet: bool,
+        announce: bool = True,
     ) -> None:
+        self._usage_sync_running = False
         if not quiet:
             self.set_busy(False)
         self._refresh_usage_cache_async()
         if err:
-            self.set_status("用量同步失败", ok=False)
+            if announce or not quiet:
+                self.set_status("用量同步失败", ok=False)
             if not quiet:
                 messagebox.showerror("同步失败", err)
             return
@@ -1495,7 +1549,8 @@ class CodexAccountApp(ctk.CTk):
             msg += f", 重归属 {result.get('reattributed')}"
         if result.get("cleared_to_unknown"):
             msg += f", 清误归属 {result.get('cleared_to_unknown')}"
-        self.set_status(msg)
+        if announce or not quiet:
+            self.set_status(msg)
         if not quiet:
             g = self.mgr.token_store().global_summary()
             lines = [
@@ -1619,14 +1674,27 @@ class CodexAccountApp(ctk.CTk):
         if not quiet or invalid or expired:
             messagebox.showinfo(title, "\n".join(lines[:40]))
 
-    def refresh_one_quota(self, profile_id: str) -> None:
+    def refresh_one_quota(self, profile_id: str, quiet: bool = False) -> None:
         """只刷新指定账户的限额（不会刷全部）。"""
         if self._busy:
+            if quiet:
+                self._focus_refresh_pending = True
             return
         profile = self.mgr.get_profile(profile_id)
+        if profile is None:
+            return
         label = (profile.email or profile.display_title()) if profile else profile_id[:8]
-        self._selected_id = profile_id
-        self.set_busy(True, f"查询限额：{label}…")
+        if not quiet:
+            self._selected_id = profile_id
+        else:
+            self._focus_quota_refresh_running = True
+            self._auto_quota_attempts[profile_id] = time.monotonic()
+        self.set_busy(
+            True,
+            "窗口回到前台，正在刷新当前账户限额…"
+            if quiet
+            else f"查询限额：{label}…",
+        )
 
         def work() -> None:
             try:
@@ -1635,7 +1703,7 @@ class CodexAccountApp(ctk.CTk):
                 result = dict(result or {})
                 result["profile_id"] = profile_id
                 result["label"] = label
-                self.after(0, lambda: self._on_quota_one_done(result))
+                self.after(0, lambda: self._on_quota_one_done(result, quiet))
             except Exception as e:
                 err = str(e)
                 self.after(
@@ -1646,18 +1714,26 @@ class CodexAccountApp(ctk.CTk):
                             "profile_id": profile_id,
                             "label": label,
                             "error": err,
-                        }
+                        },
+                        quiet,
                     ),
                 )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_quota_one_done(self, result: dict[str, Any]) -> None:
+    def _on_quota_one_done(
+        self,
+        result: dict[str, Any],
+        quiet: bool = False,
+    ) -> None:
+        if quiet:
+            self._focus_quota_refresh_running = False
         self.set_busy(False)
         # 原位更新指定卡片，不销毁或重建整张账户列表。
         profile_id = str(result.get("profile_id") or self._selected_id or "")
         if profile_id:
-            self._selected_id = profile_id
+            if not quiet:
+                self._selected_id = profile_id
             self._update_profile_card(profile_id)
             self._refresh_usage_cache_async()
         label = result.get("label") or ""
@@ -1668,14 +1744,21 @@ class CodexAccountApp(ctk.CTk):
                 summary = result.get("summary") or {}
                 left = summary.get("week_left_percent")
                 if summary.get("limit_reached") or (left is not None and left <= 0):
-                    self.set_status(f"{label}：周已用尽")
+                    text = f"{label}：周已用尽"
                 elif left is not None:
-                    self.set_status(f"{label}：周剩 {left:.0f}%")
+                    text = f"{label}：周剩 {left:.0f}%"
                 else:
-                    self.set_status(f"{label}：限额已更新")
+                    text = f"{label}：限额已更新"
+                self.set_status(
+                    f"当前账户自动刷新 · {text}" if quiet else text
+                )
         else:
             err = (result.get("error") or "")[:60]
-            self.set_status(f"{label}：限额失败 {err}".strip(), ok=False)
+            prefix = "当前账户自动刷新失败 · " if quiet else ""
+            self.set_status(
+                f"{prefix}{label}：限额失败 {err}".strip(),
+                ok=False,
+            )
 
     def reauth_profile(self, profile_id: str) -> None:
         """对失效账户：引导 OAuth，用同一邮箱重新授权。"""
@@ -1722,34 +1805,29 @@ class CodexAccountApp(ctk.CTk):
             self.set_status(f"已重新授权：{result.get('email') or ''}")
 
     def refresh_all_quotas(self, quiet: bool = False) -> None:
+        # 兼容旧调用：自动刷新现在只查询当前账户，不再走批量接口。
+        if quiet:
+            self._request_focus_quota_refresh()
+            return
         if self._busy:
-            if quiet:
-                self._focus_refresh_pending = True
             return
         if not self.mgr.list_profiles():
-            if not quiet:
-                messagebox.showinfo("提示", "还没有账户可查询")
+            messagebox.showinfo("提示", "还没有账户可查询")
             return
-        if quiet:
-            self._focus_quota_refresh_running = True
-            self._last_auto_quota_attempt_monotonic = time.monotonic()
-        self.set_busy(
-            True,
-            "窗口回到前台，正在刷新限额…" if quiet else "正在刷新全部限额…",
-        )
+        self.set_busy(True, "正在刷新全部限额…")
 
         def work() -> None:
             try:
                 results = self.mgr.refresh_all_usage()
                 self.after(
                     0,
-                    lambda: self._on_quota_all_done(results, None, quiet),
+                    lambda: self._on_quota_all_done(results, None, False),
                 )
             except Exception as e:
                 err = str(e)
                 self.after(
                     0,
-                    lambda err=err: self._on_quota_all_done(None, err, quiet),
+                    lambda err=err: self._on_quota_all_done(None, err, False),
                 )
 
         threading.Thread(target=work, daemon=True).start()

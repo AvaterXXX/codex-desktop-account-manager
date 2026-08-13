@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -207,6 +208,11 @@ class TestSwitching(unittest.TestCase):
                 events.append("launch")
                 return {"ok": True, "error": "", "cmd": ["codex"]}
 
+            usage_store = mock.Mock()
+            usage_store.log_switch.side_effect = lambda **_kwargs: events.append(
+                "timeline"
+            )
+
             with (
                 mock.patch.object(
                     mgr,
@@ -216,12 +222,14 @@ class TestSwitching(unittest.TestCase):
                 mock.patch.object(mgr, "stop_codex", side_effect=stop_old),
                 mock.patch.object(mgr, "write_live_auth", side_effect=write_target),
                 mock.patch.object(mgr, "launch_codex", side_effect=launch_new),
-                mock.patch.object(mgr, "token_store", return_value=mock.Mock()),
+                mock.patch.object(mgr, "token_store", return_value=usage_store),
             ):
                 result = mgr.switch_to(target.id, restart=True)
 
             self.assertLess(events.index("sync"), events.index("stop"))
             self.assertLess(events.index("stop"), events.index("write"))
+            self.assertLess(events.index("write"), events.index("timeline"))
+            self.assertLess(events.index("timeline"), events.index("launch"))
             self.assertLess(events.index("write"), events.index("launch"))
             self.assertEqual(account_identity_key(mgr.read_live_auth() or {}), target.identity_key)
             self.assertTrue(result["live_verified"])
@@ -277,6 +285,48 @@ class TestSwitching(unittest.TestCase):
             self.assertNotIn("tokens", live)
             self.assertEqual(mgr.detect_active_match().id, key_profile.id)
             self.assertEqual(result["profile"].auth_mode, "apikey")
+
+    def test_switch_rolls_back_when_usage_timeline_cannot_be_saved(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            store = Path(td) / "store"
+            home = Path(td) / "codex"
+            home.mkdir()
+            mgr = CodexAccountManager(store_dir=store, codex_home=home)
+            current_auth = self._chatgpt_auth("current")
+            target_auth = self._chatgpt_auth("target")
+            current = mgr.import_auth_dict(
+                current_auth,
+                name="current",
+                make_active=True,
+            )
+            target = mgr.import_auth_dict(target_auth, name="target")
+            atomic_write_json(home / "auth.json", current_auth)
+            usage_store = mock.Mock()
+            usage_store.log_switch.side_effect = OSError("disk unavailable")
+
+            with (
+                mock.patch.object(mgr, "sync_active_from_live"),
+                mock.patch.object(
+                    mgr,
+                    "stop_codex",
+                    return_value={"stopped": True, "killed": [], "remaining": []},
+                ),
+                mock.patch.object(
+                    mgr,
+                    "launch_codex",
+                    return_value={"ok": True},
+                ) as launch,
+                mock.patch.object(mgr, "token_store", return_value=usage_store),
+                self.assertRaises(OSError),
+            ):
+                mgr.switch_to(target.id, restart=True)
+
+            self.assertEqual(
+                account_identity_key(mgr.read_live_auth() or {}),
+                current.identity_key,
+            )
+            self.assertEqual(mgr.config.active_id, current.id)
+            launch.assert_called_once()
 
 
 class TestDeletion(unittest.TestCase):
@@ -606,6 +656,7 @@ class TestFocusQuotaRefresh(unittest.TestCase):
             state=lambda: "iconic",
             after=lambda delay, callback: scheduled.append((delay, callback)) or "next",
             _poll_foreground_state=lambda: None,
+            _request_focus_usage_sync=lambda: requested.append(False),
             _request_focus_quota_refresh=lambda: requested.append(True),
         )
 
@@ -617,7 +668,7 @@ class TestFocusQuotaRefresh(unittest.TestCase):
         self.assertEqual(app._foreground_poll_after_id, "next")
 
     def test_real_foreground_transition_requests_one_refresh(self):
-        requested: list[bool] = []
+        requested: list[str] = []
         app = SimpleNamespace(
             _foreground_poll_after_id="pending",
             _window_was_foreground=False,
@@ -626,7 +677,8 @@ class TestFocusQuotaRefresh(unittest.TestCase):
             focus_displayof=lambda: True,
             after=lambda _delay, _callback: "next",
             _poll_foreground_state=lambda: None,
-            _request_focus_quota_refresh=lambda: requested.append(True),
+            _request_focus_usage_sync=lambda: requested.append("usage"),
+            _request_focus_quota_refresh=lambda: requested.append("quota"),
         )
         with mock.patch(
             "windows_app.is_current_process_foreground",
@@ -636,7 +688,7 @@ class TestFocusQuotaRefresh(unittest.TestCase):
             CodexAccountApp._poll_foreground_state(app)
 
         self.assertTrue(app._window_was_foreground)
-        self.assertEqual(requested, [True])
+        self.assertEqual(requested, ["usage", "quota"])
 
     def test_recent_quota_cache_skips_auto_refresh(self):
         profile = AccountProfile(
@@ -648,14 +700,14 @@ class TestFocusQuotaRefresh(unittest.TestCase):
             ).isoformat(),
         )
         app = SimpleNamespace(
-            mgr=SimpleNamespace(list_profiles=lambda: [profile]),
-            _last_auto_quota_attempt_monotonic=0.0,
+            _auto_quota_attempts={},
             _usage_fetched_epoch=CodexAccountApp._usage_fetched_epoch,
         )
 
         self.assertFalse(
             CodexAccountApp._auto_quota_refresh_due(
                 app,
+                profile,
                 now_epoch=1_000_000,
                 now_monotonic=500,
             )
@@ -671,14 +723,14 @@ class TestFocusQuotaRefresh(unittest.TestCase):
             ).isoformat(),
         )
         app = SimpleNamespace(
-            mgr=SimpleNamespace(list_profiles=lambda: [profile]),
-            _last_auto_quota_attempt_monotonic=0.0,
+            _auto_quota_attempts={},
             _usage_fetched_epoch=CodexAccountApp._usage_fetched_epoch,
         )
 
         self.assertTrue(
             CodexAccountApp._auto_quota_refresh_due(
                 app,
+                profile,
                 now_epoch=1_000_000,
                 now_monotonic=500,
             )
@@ -687,29 +739,50 @@ class TestFocusQuotaRefresh(unittest.TestCase):
     def test_recent_failed_attempt_blocks_an_immediate_retry(self):
         profile = AccountProfile(id="p1", name="p1")
         app = SimpleNamespace(
-            mgr=SimpleNamespace(list_profiles=lambda: [profile]),
-            _last_auto_quota_attempt_monotonic=450.0,
+            _auto_quota_attempts={profile.id: 450.0},
             _usage_fetched_epoch=CodexAccountApp._usage_fetched_epoch,
         )
 
         self.assertFalse(
             CodexAccountApp._auto_quota_refresh_due(
                 app,
+                profile,
+                now_epoch=1_000_000,
+                now_monotonic=500,
+            )
+        )
+
+    def test_auto_quota_attempt_cooldown_is_per_account(self):
+        old = AccountProfile(id="old", name="old")
+        current = AccountProfile(id="current", name="current")
+        app = SimpleNamespace(
+            _auto_quota_attempts={old.id: 450.0},
+            _usage_fetched_epoch=CodexAccountApp._usage_fetched_epoch,
+        )
+
+        self.assertTrue(
+            CodexAccountApp._auto_quota_refresh_due(
+                app,
+                current,
                 now_epoch=1_000_000,
                 now_monotonic=500,
             )
         )
 
     def test_foreground_refresh_is_silent_and_busy_refresh_is_coalesced(self):
-        calls: list[bool] = []
+        calls: list[tuple[str, bool]] = []
+        current = AccountProfile(id="current", name="current")
         app = SimpleNamespace(
             _busy=False,
             _focus_quota_refresh_running=False,
             _focus_refresh_pending=False,
             _window_was_foreground=False,
             state=lambda: "normal",
-            _auto_quota_refresh_due=lambda: True,
-            refresh_all_quotas=lambda quiet=False: calls.append(quiet),
+            _current_quota_profile=lambda: current,
+            _auto_quota_refresh_due=lambda profile: profile.id == current.id,
+            refresh_one_quota=lambda profile_id, quiet=False: calls.append(
+                (profile_id, quiet)
+            ),
         )
         with mock.patch(
             "windows_app.is_current_process_foreground",
@@ -719,8 +792,54 @@ class TestFocusQuotaRefresh(unittest.TestCase):
             app._busy = True
             CodexAccountApp._request_focus_quota_refresh(app)
 
-        self.assertEqual(calls, [True])
+        self.assertEqual(calls, [(current.id, True)])
         self.assertTrue(app._focus_refresh_pending)
+
+    def test_foreground_local_usage_sync_is_throttled_without_network(self):
+        calls: list[tuple[bool, bool]] = []
+        app = SimpleNamespace(
+            _busy=False,
+            _usage_sync_running=False,
+            _last_auto_usage_sync_monotonic=0.0,
+        )
+
+        def sync_token_usage(*, quiet: bool, announce: bool) -> None:
+            calls.append((quiet, announce))
+            app._last_auto_usage_sync_monotonic = 500.0
+
+        app.sync_token_usage = sync_token_usage
+        with mock.patch("main.time.monotonic", return_value=500.0):
+            CodexAccountApp._request_focus_usage_sync(app)
+            CodexAccountApp._request_focus_usage_sync(app)
+
+        self.assertEqual(calls, [(True, False)])
+
+    def test_background_usage_sync_repairs_existing_attribution(self):
+        result = {
+            "scanned_files": 0,
+            "inserted_events": 0,
+            "attribution": {},
+        }
+        mgr = SimpleNamespace(sync_token_usage=mock.Mock(return_value=result))
+        callbacks: list[tuple[object, object, bool, bool]] = []
+        app = SimpleNamespace(
+            mgr=mgr,
+            _busy=False,
+            _usage_sync_running=False,
+            _last_auto_usage_sync_monotonic=0.0,
+            set_busy=lambda *_args, **_kwargs: None,
+            set_status=lambda *_args, **_kwargs: None,
+            after=lambda _delay, callback: callback(),
+            _on_usage_sync_done=lambda data, err, quiet, announce: callbacks.append(
+                (data, err, quiet, announce)
+            ),
+        )
+        with mock.patch("main.threading.Thread") as thread:
+            CodexAccountApp.sync_token_usage(app, quiet=True, announce=False)
+            thread.call_args.kwargs["target"]()
+
+        mgr.sync_token_usage.assert_called_once_with(reattribute=True)
+        self.assertEqual(callbacks, [(result, None, True, False)])
 
 
 class TestTokenRefreshPolicy(unittest.TestCase):
@@ -818,6 +937,32 @@ class TestUsageParse(unittest.TestCase):
 
 
 class TestTokenUsageScan(unittest.TestCase):
+    def test_manager_only_rechecks_full_attribution_when_needed(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            mgr = CodexAccountManager(
+                store_dir=root / "store",
+                codex_home=root / "codex",
+            )
+            usage_store = mock.Mock()
+            usage_store.sync_sessions.side_effect = [
+                {"inserted_events": 0},
+                {"inserted_events": 0},
+                {"inserted_events": 2},
+            ]
+            usage_store.reattribute_all.return_value = {
+                "updated": 0,
+                "cleared_to_unknown": 0,
+            }
+            usage_store.count_stats.return_value = {}
+            mgr._token_store = usage_store
+
+            mgr.sync_token_usage(reattribute=True)
+            mgr.sync_token_usage(reattribute=True)
+            mgr.sync_token_usage(reattribute=True)
+
+            self.assertEqual(usage_store.reattribute_all.call_count, 2)
+
     def test_total_tokens_fallback(self):
         self.assertEqual(
             TokenUsageStore._usage_total({"input_tokens": 10, "output_tokens": 5}),
@@ -919,6 +1064,141 @@ class TestTokenUsageScan(unittest.TestCase):
                     )
                 ]
             self.assertEqual(accounts, ["a1", "a2", "a2"])
+
+    def test_session_events_follow_account_switch_timeline(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            store = Path(td) / "store"
+            sessions = Path(td) / "sessions"
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout-switch.jsonl"
+
+            def event(timestamp: str, tokens: int) -> str:
+                return json.dumps(
+                    {
+                        "timestamp": timestamp,
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": tokens,
+                                    "output_tokens": 0,
+                                    "total_tokens": tokens,
+                                }
+                            },
+                        },
+                    }
+                )
+
+            rollout.write_text(
+                event("1970-01-01T00:00:05Z", 5)
+                + "\n"
+                + event("1970-01-01T00:00:15Z", 15)
+                + "\n",
+                encoding="utf-8",
+            )
+            tus = TokenUsageStore(store, sessions_dir=sessions)
+            tus.log_switch(profile_id="p1", account_id="a1", ts=0)
+            tus.log_switch(profile_id="p2", account_id="a2", ts=10)
+
+            result = tus.sync_sessions(full=True, recent_days=None, max_files=None)
+
+            self.assertEqual(result["inserted_events"], 2)
+            self.assertEqual(
+                tus.summarize(profile_id="p1")["totals"]["total_tokens"],
+                5,
+            )
+            self.assertEqual(
+                tus.summarize(profile_id="p2")["totals"]["total_tokens"],
+                15,
+            )
+
+    def test_late_switch_record_repairs_events_already_in_database(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            store = Path(td) / "store"
+            sessions = Path(td) / "sessions"
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout-late-switch.jsonl"
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "1970-01-01T00:00:15Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 15,
+                                    "total_tokens": 15,
+                                }
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            tus = TokenUsageStore(store, sessions_dir=sessions)
+            tus.log_switch(profile_id="p1", account_id="a1", ts=0)
+            tus.sync_sessions(full=True, recent_days=None, max_files=None)
+            self.assertEqual(
+                tus.summarize(profile_id="p1")["totals"]["total_tokens"],
+                15,
+            )
+
+            tus.log_switch(profile_id="p2", account_id="a2", ts=10)
+
+            self.assertEqual(
+                tus.summarize(profile_id="p1")["totals"]["total_tokens"],
+                0,
+            )
+            self.assertEqual(
+                tus.summarize(profile_id="p2")["totals"]["total_tokens"],
+                15,
+            )
+
+    def test_session_scan_and_switch_logging_are_serialized(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            store = Path(td) / "store"
+            sessions = Path(td) / "sessions"
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout-lock.jsonl"
+            rollout.write_text("{}\n", encoding="utf-8")
+            tus = TokenUsageStore(store, sessions_dir=sessions)
+            scan_started = threading.Event()
+            release_scan = threading.Event()
+            switch_attempted = threading.Event()
+            switch_done = threading.Event()
+            original_scan = tus._scan_file
+
+            def blocked_scan(*args, **kwargs):
+                scan_started.set()
+                self.assertTrue(release_scan.wait(2))
+                return original_scan(*args, **kwargs)
+
+            def run_scan() -> None:
+                tus.sync_sessions(full=True, recent_days=None, max_files=None)
+
+            def run_switch() -> None:
+                switch_attempted.set()
+                tus.log_switch(profile_id="p2", account_id="a2", ts=10)
+                switch_done.set()
+
+            with mock.patch.object(tus, "_scan_file", side_effect=blocked_scan):
+                scan_thread = threading.Thread(target=run_scan)
+                scan_thread.start()
+                self.assertTrue(scan_started.wait(2))
+                switch_thread = threading.Thread(target=run_switch)
+                switch_thread.start()
+                self.assertTrue(switch_attempted.wait(2))
+                self.assertFalse(switch_done.wait(0.1))
+                release_scan.set()
+                scan_thread.join(2)
+                switch_thread.join(2)
+
+            self.assertFalse(scan_thread.is_alive())
+            self.assertFalse(switch_thread.is_alive())
+            self.assertTrue(switch_done.is_set())
 
 
 class TestOAuthIsolation(unittest.TestCase):

@@ -7,7 +7,7 @@
     <img alt="Windows" src="https://img.shields.io/badge/Windows-10%20%2F%2011-2563EB?logo=windows" />
     <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" />
     <img alt="Local first" src="https://img.shields.io/badge/credentials-local%20only-059669" />
-    <img alt="Release" src="https://img.shields.io/badge/release-v1.0.1-7C3AED" />
+    <img alt="Release" src="https://img.shields.io/badge/release-v1.0.2-7C3AED" />
   </p>
   <p><a href="#中文">中文</a> · <a href="#english">English</a></p>
 </div>
@@ -25,7 +25,7 @@ Codex Desktop Account Manager 是一个面向 Windows 版 Codex Desktop 的本�
 | 一键切换账户 | 先安全结束旧 Codex，再写入目标凭据并校验，最后自动重新打开 Codex |
 | 本地 PKCE OAuth | 使用 Chrome 无痕窗口添加账户，不运行 `codex login`，添加时不覆盖当前 Codex 登录 |
 | 当前账户识别 | 自动识别正在使用的账户，并在唯一状态位显示“当前” |
-| 智能自动刷新 | 打开软件或从其他应用切回本窗口时，仅在限额缓存超过 5 分钟后静默刷新；内部点击、最小化和后台状态不请求，手动按钮可随时强制刷新 |
+| 智能自动刷新 | 回到前台时先增量同步本地用量（不联网），并且仅在当前账户限额缓存超过 5 分钟后查询该账户；自动过程中其他账户、内部点击、最小化和后台状态不请求，手动按钮仍可强制刷新全部 |
 | 清晰的限额提醒 | 剩余 `<= 40%` 显示黄色，`<= 10%` 显示红色 |
 | 两种用量口径 | 列表显示当前限额周期内的本地已归属用量；“用量”详情显示该账户全部已归属历史 |
 | 本地账户库 | 导入、导出、复制、重命名、扫描备份和删除账户快照 |
@@ -47,6 +47,7 @@ Codex Desktop Account Manager 是一个面向 Windows 版 Codex Desktop 的本�
 - “本期用量”按 `周期起点 = 重置时间 - 窗口时长` 过滤本机 Codex 会话中的 token 事件。
 - “用量”按钮展示此账户全部已明确归属的本地历史，不受当前限额周期过滤。
 - Codex 会话文件本身不总是带账户 ID，因此工具只统计能够通过切换时间线明确归属的记录。官方百分比与本地 token 数不是同一种计量单位。
+- 切换账户时会在启动新 Codex 前可靠写入时间边界；会话扫描与切换串行执行，并在回到前台时自动修复能够依据时间线确定的旧归属。
 
 ### 安全与隐私
 
@@ -102,7 +103,7 @@ Codex Desktop Account Manager is a local Windows utility for managing multiple C
 | One-click switching | Stops the old Codex process, writes and verifies the target credentials, then relaunches Codex |
 | Local PKCE OAuth | Adds an account in a Chrome Incognito window without running `codex login` or replacing the active login |
 | Active-account detection | Detects the live identity and shows a single “Current” status badge |
-| Smart auto-refresh | On launch or a true return from another app, quotas refresh only when the cache is at least 5 minutes old; internal clicks, minimized, and background states make no requests, while manual refresh always forces one |
+| Smart auto-refresh | Returning to the foreground first syncs local usage without networking, then queries only the active account when its quota cache is at least 5 minutes old; automatic refresh ignores other accounts, internal clicks, minimized, and background states, while the manual button can still force a full refresh |
 | Quota warnings | Remaining quota `<= 40%` is yellow and `<= 10%` is red |
 | Two usage scopes | The account row shows locally attributed usage for the current quota window; the Usage dialog shows all attributed history |
 | Local profile library | Import, export, copy, rename, scan backups, and delete account snapshots |
@@ -123,6 +124,7 @@ Getting started:
 - Weekly quota percentages come from the official Codex usage endpoint.
 - Current-window usage filters local Codex token events using `window start = reset time - window duration`.
 - The **Usage** dialog is intentionally unfiltered and shows all locally recorded events that can be attributed to the selected account.
+- Account switches persist a reliable time boundary before the new Codex process starts. Session scans are serialized with switching, and foreground sync repairs older assignments that the timeline can determine.
 - Codex session files do not always contain an account ID, so only events that can be attributed through the switch timeline are counted. Official quota percentages and local token totals are different measurements.
 
 ### Security and privacy
