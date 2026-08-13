@@ -26,7 +26,7 @@ Codex Desktop Account Manager 是一个面向 Windows 版 Codex Desktop 的本�
 | 本地 PKCE OAuth | 使用 Chrome 无痕窗口添加账户，不运行 `codex login`，添加时不覆盖当前 Codex 登录 |
 | 当前账户识别 | 自动识别正在使用的账户，并在唯一状态位显示“当前” |
 | 聚焦自动刷新 | 打开软件或从其他应用切回本窗口时，静默刷新全部账户限额；最小化和后台状态不刷新 |
-| 清晰的限额提醒 | 剩余 `≤ 40%` 显示黄色，`≤ 10%` 显示红色 |
+| 清晰的限额提醒 | 剩余 `<= 40%` 显示黄色，`<= 10%` 显示红色 |
 | 两种用量口径 | 列表显示当前限额周期内的本地已归属用量；“用量”详情显示该账户全部已归属历史 |
 | 本地账户库 | 导入、导出、复制、重命名、扫描备份和删除账户快照 |
 | API Key 模式 | 可保存和切换 API Key；它按 API 用量计费，不占用 ChatGPT Plus/Pro 周限额 |
@@ -44,7 +44,7 @@ Codex Desktop Account Manager 是一个面向 Windows 版 Codex Desktop 的本�
 ### 用量与限额口径
 
 - “周限额”来自 Codex 官方用量接口；百分比代表官方限额剩余情况。
-- “本期用量”按 `周期起点 = 重置时间 − 窗口时长` 过滤本机 Codex 会话中的 token 事件。
+- “本期用量”按 `周期起点 = 重置时间 - 窗口时长` 过滤本机 Codex 会话中的 token 事件。
 - “用量”按钮展示此账户全部已明确归属的本地历史，不受当前限额周期过滤。
 - Codex 会话文件本身不总是带账户 ID，因此工具只统计能够通过切换时间线明确归属的记录。官方百分比与本地 token 数不是同一种计量单位。
 
@@ -103,7 +103,7 @@ Codex Desktop Account Manager is a local Windows utility for managing multiple C
 | Local PKCE OAuth | Adds an account in a Chrome Incognito window without running `codex login` or replacing the active login |
 | Active-account detection | Detects the live identity and shows a single “Current” status badge |
 | Refresh on focus | Silently refreshes all quotas when the app opens or returns to the foreground; no refresh while minimized or in the background |
-| Quota warnings | Remaining quota `≤ 40%` is yellow and `≤ 10%` is red |
+| Quota warnings | Remaining quota `<= 40%` is yellow and `<= 10%` is red |
 | Two usage scopes | The account row shows locally attributed usage for the current quota window; the Usage dialog shows all attributed history |
 | Local profile library | Import, export, copy, rename, scan backups, and delete account snapshots |
 | API-key mode | Stores and switches API keys, which are billed as API usage and do not consume a ChatGPT Plus/Pro weekly quota |
@@ -121,7 +121,7 @@ Getting started:
 ### Usage and quota semantics
 
 - Weekly quota percentages come from the official Codex usage endpoint.
-- Current-window usage filters local Codex token events using `window start = reset time − window duration`.
+- Current-window usage filters local Codex token events using `window start = reset time - window duration`.
 - The **Usage** dialog is intentionally unfiltered and shows all locally recorded events that can be attributed to the selected account.
 - Codex session files do not always contain an account ID, so only events that can be attributed through the switch timeline are counted. Official quota percentages and local token totals are different measurements.
 
